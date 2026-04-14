@@ -24,18 +24,31 @@
 //
 // Verification (--verify)
 // -----------------------
-// When --verify is passed the benchmark is replaced by a correctness check.
-// Each graph node is assigned a unique ID in [0, N). The verify_kernel writes
-//   buf[nodeId] = nodeId + 1
-// After a single graph launch + sync, every slot is checked:
-//   buf[i] == i+1  for all i in [0, actual_node_count)
+// Replaces null_kernel with a reduction-based ordering check:
 //
-// This confirms:
-//   - All N kernels executed (every slot nonzero).
-//   - For hexagon topologies: the join node's slot is set only if all parallel
-//     branches finished first; the trailing chain proves the join completed
-//     before it ran.  Checking all slots transitively validates fan-out/fan-in.
-//   - For full-parallel topologies: each independent chain ran to completion.
+//   verify_kernel writes:
+//     buf[nodeId] = sum(buf[dep_ids]) + 1
+//
+// For a root node (no deps) this is 1.  For a chain node it is predecessor+1.
+// For the hexagon join it is the sum of all branch-tail values plus 1.
+//
+// Expected values are computed on the CPU at build time using the same
+// recurrence.  Only the graph's exit node(s) are checked:
+//
+//   straight / paths*  : one exit (tail of trailing chain)
+//   full2 / full4      : one exit per independent chain
+//
+// If any node ran before its dependencies, its buf slot holds a smaller value
+// than expected (it read zeros instead of its predecessor's value), and that
+// propagates to the exit — so a single wrong exit value catches the race.
+//
+// Example  paths2, N=12, seg=3:
+//   Lead:    buf[0]=1  buf[1]=2  buf[2]=3
+//   Branch0: buf[3]=4  buf[4]=5  buf[5]=6
+//   Branch1: buf[6]=4  buf[7]=5  buf[8]=6
+//   Join:    buf[9] = buf[5]+buf[8]+1 = 13  (wrong if either branch not done)
+//   Tail:    buf[10]=14  buf[11]=15
+//   Check:   buf[11] == 15
 //
 // Build (HIP/AMD):
 //   /opt/rocm/bin/hipcc -O2 -o graph_bench graph_bench.cpp
@@ -56,7 +69,7 @@
 //   --sync            Submission + GPU execution latency
 //   --sweep           Run across all sizes: 1, 2, 4, ..., 8192
 //   --topology <name> Benchmark only the named topology (default: all)
-//   --verify          Run correctness check instead of timing
+//   --verify          Run ordering correctness check instead of timing
 
 // ---------------------------------------------------------------------------
 // HIP / CUDA portability layer
@@ -109,6 +122,7 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -159,49 +173,101 @@ class Timer {
 
 __global__ void null_kernel() {}
 
-// Writes nodeId+1 to buf[nodeId].  Used in --verify mode so that every node
-// leaves a unique, checkable footprint in device memory.
-__global__ void verify_kernel(int* buf, int nodeId) {
-  buf[nodeId] = nodeId + 1;
+// Reduction-based ordering kernel.
+//
+// Writes buf[nodeId] = buf[d0] + buf[d1] + buf[d2] + buf[d3] + 1
+// where d0..d3 are the IDs of this node's graph predecessors (unused slots
+// are 0 and excluded via ndeps).
+//
+// If any predecessor has not yet written its slot (i.e. ran out of order),
+// buf[dep] is still 0 and the computed value will be smaller than expected.
+// That deficit propagates through the chain to the exit node, where a single
+// comparison catches the ordering violation.
+//
+// Supports up to 4 predecessor IDs, which is enough for paths4 (join has 4).
+__global__ void verify_kernel(int* buf, int nodeId,
+                               int d0, int d1, int d2, int d3, int ndeps) {
+  int val = 1;
+  if (ndeps > 0) val += buf[d0];
+  if (ndeps > 1) val += buf[d1];
+  if (ndeps > 2) val += buf[d2];
+  if (ndeps > 3) val += buf[d3];
+  buf[nodeId] = val;
 }
 
 // ---------------------------------------------------------------------------
 // Verification context
 // ---------------------------------------------------------------------------
 
-// Passed to graph builders when --verify is active.  The builder calls
-// add_node() for every kernel it adds; add_node() assigns a monotonically
-// increasing ID and wires up verify_kernel.  After the build, next_id equals
-// the actual number of nodes, which is the size needed for dev_buf.
+// Passed to graph builders when --verify is active.
+//
+// add_node() auto-assigns a node ID, registers the handle->ID mapping (so
+// that later nodes can resolve their predecessor IDs by handle), computes the
+// expected output value using the same recurrence as verify_kernel, and wires
+// up verify_kernel in the graph node.
+//
+// After the build, exits[] contains the exit node ID(s) and expected[] holds
+// the correct value for every node.  Only the exit values are checked.
 struct VerifyCtx {
-  int* dev_buf  = nullptr;  // device buffer of size >= next_id (caller-owned)
-  int  next_id  = 0;        // auto-incremented as nodes are added
+  int*  dev_buf  = nullptr;  // device buffer, size >= next_id (caller-owned)
+  int   next_id  = 0;        // auto-incremented as nodes are added
+
+  std::vector<int>                             expected;    // expected[nodeId]
+  std::vector<int>                             exits;       // exit node IDs
+  std::unordered_map<hipGraphNode_t, int>      node_to_id;  // handle -> ID
 };
 
 // ---------------------------------------------------------------------------
 // Node helper
 // ---------------------------------------------------------------------------
 
-// Add one kernel node to graph g.  If ctx is non-null the node runs
-// verify_kernel; otherwise it runs null_kernel.
-static void add_node(hipGraph_t g, hipGraphNode_t* cur,
-                     const hipGraphNode_t* deps, int ndeps,
-                     VerifyCtx* ctx) {
+// Add one kernel node to graph g depending on deps[0..ndeps-1].
+//
+// Non-verify mode (ctx == nullptr): wires null_kernel, returns -1.
+//
+// Verify mode: assigns the next ID, resolves predecessor handles to IDs via
+// ctx->node_to_id, computes the expected value, sets up verify_kernel with
+// the dep IDs as arguments, registers the new handle, and returns the ID.
+// The caller is responsible for adding the returned ID to ctx->exits if this
+// is an exit node.
+static int add_node(hipGraph_t g, hipGraphNode_t* cur,
+                    const hipGraphNode_t* deps, int ndeps,
+                    VerifyCtx* ctx) {
   hipKernelNodeParams p{};
   p.gridDim  = {1, 1, 1};
   p.blockDim = {1, 1, 1};
 
-  if (ctx) {
-    int   id   = ctx->next_id++;
-    void* args[] = {reinterpret_cast<void*>(&ctx->dev_buf),
-                    reinterpret_cast<void*>(&id)};
-    p.func         = reinterpret_cast<void*>(verify_kernel);
-    p.kernelParams = args;
-    HIP_CHECK(hipGraphAddKernelNode(cur, g, deps, ndeps, &p));
-  } else {
+  if (!ctx) {
     p.func = reinterpret_cast<void*>(null_kernel);
     HIP_CHECK(hipGraphAddKernelNode(cur, g, deps, ndeps, &p));
+    return -1;
   }
+
+  // Resolve predecessor handles to IDs and compute expected value on CPU.
+  int d[4]  = {0, 0, 0, 0};
+  int exp   = 1;
+  for (int i = 0; i < ndeps && i < 4; ++i) {
+    d[i] = ctx->node_to_id.at(deps[i]);
+    exp += ctx->expected[d[i]];
+  }
+
+  int id = ctx->next_id++;
+  ctx->expected.push_back(exp);
+
+  // hipGraphAddKernelNode copies args immediately, so locals are safe here.
+  void* args[] = {reinterpret_cast<void*>(&ctx->dev_buf),
+                  reinterpret_cast<void*>(&id),
+                  reinterpret_cast<void*>(&d[0]),
+                  reinterpret_cast<void*>(&d[1]),
+                  reinterpret_cast<void*>(&d[2]),
+                  reinterpret_cast<void*>(&d[3]),
+                  reinterpret_cast<void*>(&ndeps)};
+  p.func         = reinterpret_cast<void*>(verify_kernel);
+  p.kernelParams = args;
+  HIP_CHECK(hipGraphAddKernelNode(cur, g, deps, ndeps, &p));
+
+  ctx->node_to_id[*cur] = id;  // register after hipGraphAddKernelNode sets *cur
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,15 +275,19 @@ static void add_node(hipGraph_t g, hipGraphNode_t* cur,
 // ---------------------------------------------------------------------------
 
 // straight: single linear chain of N nodes.
+// Exit: the last node.
 static hipGraphExec_t build_straight(int N, VerifyCtx* ctx = nullptr) {
   hipGraph_t g;
   HIP_CHECK(hipGraphCreate(&g, 0));
 
   hipGraphNode_t prev{}, cur{};
+  int prev_id = -1, cur_id = -1;
   for (int i = 0; i < N; ++i) {
-    add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
-    prev = cur;
+    cur_id  = add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
+    prev    = cur;
+    prev_id = cur_id;
   }
+  if (ctx && cur_id >= 0) ctx->exits.push_back(cur_id);
 
   hipGraphExec_t e;
   HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
@@ -229,10 +299,11 @@ static hipGraphExec_t build_straight(int N, VerifyCtx* ctx = nullptr) {
 //   seg = N / (P + 2)  nodes per segment
 //   total segments     = P + 2
 //
-// Verification note: the join node depends on all P branch-tail nodes, so its
-// slot in dev_buf can only be written after every branch completes.  The
-// trailing chain's slots prove the join itself finished.  Checking all slots
-// therefore fully validates the fan-out / fan-in ordering.
+// Ordering guarantee encoded in expected values:
+//   join's expected = sum(branch_tail_expected[0..P-1]) + 1
+// If any branch tail ran after the join, its buf slot is 0 at join time,
+// making the join's actual value smaller than expected. That deficit
+// propagates through the tail chain to the single exit node.
 static hipGraphExec_t build_multi_path(int N, int P, VerifyCtx* ctx = nullptr) {
   const int seg = std::max(1, N / (P + 2));
 
@@ -241,31 +312,45 @@ static hipGraphExec_t build_multi_path(int N, int P, VerifyCtx* ctx = nullptr) {
 
   // Leading straight chain.
   hipGraphNode_t prev{}, cur{};
+  int prev_id = -1, cur_id = -1;
   for (int i = 0; i < seg; ++i) {
-    add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
-    prev = cur;
+    cur_id  = add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
+    prev    = cur;
+    prev_id = cur_id;
   }
-  hipGraphNode_t split_end = prev;
+  hipGraphNode_t split_node    = prev;
+  int            split_node_id = cur_id;
 
-  // P parallel branches, each rooted at split_end.
+  // P parallel branches, each rooted at split_node.
   std::vector<hipGraphNode_t> path_ends(P);
+  std::vector<int>            path_end_ids(P);
   for (int path = 0; path < P; ++path) {
-    hipGraphNode_t pprev = split_end, pcur{};
+    hipGraphNode_t pprev    = split_node;
+    int            pprev_id = split_node_id;
+    hipGraphNode_t pcur{};
+    int            pcur_id = -1;
     for (int i = 0; i < seg; ++i) {
-      add_node(g, &pcur, &pprev, 1, ctx);
-      pprev = pcur;
+      pcur_id = add_node(g, &pcur, &pprev, 1, ctx);
+      pprev   = pcur;
+      pprev_id = pcur_id;
     }
-    path_ends[path] = pprev;
+    path_ends[path]     = pprev;
+    path_end_ids[path]  = pprev_id;
   }
 
   // Join node: depends on all P branch tails.
   hipGraphNode_t join{};
-  add_node(g, &join, path_ends.data(), P, ctx);
-  prev = join;
+  int join_id = add_node(g, &join, path_ends.data(), P, ctx);
+  prev    = join;
+  prev_id = join_id;
+
+  // Trailing straight chain.
   for (int i = 1; i < seg; ++i) {
-    add_node(g, &cur, &prev, 1, ctx);
-    prev = cur;
+    cur_id  = add_node(g, &cur, &prev, 1, ctx);
+    prev    = cur;
+    prev_id = cur_id;
   }
+  if (ctx && prev_id >= 0) ctx->exits.push_back(prev_id);
 
   hipGraphExec_t e;
   HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
@@ -282,9 +367,7 @@ static hipGraphExec_t build_paths4(int N, VerifyCtx* ctx = nullptr) {
 
 // fully parallel: P independent chains of N/P nodes.
 // No synchronisation point — GPU can schedule all chains concurrently.
-//
-// Verification note: chains are fully independent, so checking all slots
-// confirms every chain ran to completion.
+// Exit: last node of each chain (P exits total).
 static hipGraphExec_t build_full_parallel(int N, int P,
                                           VerifyCtx* ctx = nullptr) {
   const int seg = std::max(1, N / P);
@@ -294,10 +377,14 @@ static hipGraphExec_t build_full_parallel(int N, int P,
 
   for (int path = 0; path < P; ++path) {
     hipGraphNode_t pprev{}, pcur{};
+    int            pprev_id = -1, pcur_id = -1;
     for (int i = 0; i < seg; ++i) {
-      add_node(g, &pcur, i == 0 ? nullptr : &pprev, i == 0 ? 0 : 1, ctx);
-      pprev = pcur;
+      pcur_id  = add_node(g, &pcur,
+                          i == 0 ? nullptr : &pprev, i == 0 ? 0 : 1, ctx);
+      pprev    = pcur;
+      pprev_id = pcur_id;
     }
+    if (ctx && pprev_id >= 0) ctx->exits.push_back(pprev_id);
   }
 
   hipGraphExec_t e;
@@ -317,14 +404,10 @@ static hipGraphExec_t build_full4(int N, VerifyCtx* ctx = nullptr) {
 // Benchmark runner
 // ---------------------------------------------------------------------------
 
-// Returns average hipGraphLaunch time in microseconds over `iters` launches.
-// If syncInTiming is true, hipStreamSynchronize is included in each sample.
-// The stream is always drained between samples to avoid carry-over GPU work.
 static double bench(hipGraphExec_t exec, int iters, bool syncInTiming) {
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
 
-  // Warm-up.
   for (int i = 0; i < 10; ++i) HIP_CHECK(hipGraphLaunch(exec, stream));
   HIP_CHECK(hipStreamSynchronize(stream));
 
@@ -346,17 +429,18 @@ static double bench(hipGraphExec_t exec, int iters, bool syncInTiming) {
 // Verification runner
 // ---------------------------------------------------------------------------
 
-// Builds the graph with verify_kernel nodes, launches it once, copies the
-// result back, and checks buf[i] == i+1 for every node i.
-// Returns true on PASS.
-static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N) {
+// Builds the graph with verify_kernel nodes, launches once, copies back the
+// device buffer, and checks only the exit node(s) against their expected
+// values.  A wrong exit value means some node ran before a dependency.
+static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N,
+                   const char* name) {
   VerifyCtx ctx;
-  // Allocate a device buffer sized for the maximum possible node count.
+  // Over-allocate: actual node count (after integer-division seg rounding)
+  // may be slightly less than N, but never more.
   HIP_CHECK(hipMalloc(&ctx.dev_buf, N * sizeof(int)));
   HIP_CHECK(hipMemset(ctx.dev_buf, 0, N * sizeof(int)));
 
   hipGraphExec_t exec = build(N, &ctx);
-  const int actual_n  = ctx.next_id;  // real node count after build
 
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
@@ -364,21 +448,28 @@ static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N) {
   HIP_CHECK(hipStreamSynchronize(stream));
   HIP_CHECK(hipStreamDestroy(stream));
 
-  std::vector<int> host(actual_n);
-  HIP_CHECK(hipMemcpy(host.data(), ctx.dev_buf, actual_n * sizeof(int),
+  // Copy only the slots we need.
+  const int total = ctx.next_id;
+  std::vector<int> host(total);
+  HIP_CHECK(hipMemcpy(host.data(), ctx.dev_buf, total * sizeof(int),
                       hipMemcpyDeviceToHost));
 
   HIP_CHECK(hipGraphExecDestroy(exec));
   HIP_CHECK(hipFree(ctx.dev_buf));
 
-  for (int i = 0; i < actual_n; ++i) {
-    if (host[i] != i + 1) {
-      fprintf(stderr, "  FAIL: buf[%d] = %d, expected %d\n", i, host[i],
-              i + 1);
-      return false;
+  bool pass = true;
+  for (int exit_id : ctx.exits) {
+    const int got      = host[exit_id];
+    const int expected = ctx.expected[exit_id];
+    if (got != expected) {
+      fprintf(stderr,
+              "  [%s] FAIL exit node %d: got %d, expected %d "
+              "(ordering violation detected)\n",
+              name, exit_id, got, expected);
+      pass = false;
     }
   }
-  return true;
+  return pass;
 }
 
 // ---------------------------------------------------------------------------
@@ -419,16 +510,15 @@ int main(int argc, char* argv[]) {
 
   struct Topo {
     const char*       name;
-    hipGraphExec_t  (*build)(int, VerifyCtx*);
-    hipGraphExec_t  (*build_bench)(int);  // no-ctx wrapper for bench()
+    hipGraphExec_t  (*build)(int, VerifyCtx*);  // verify-capable builder
+    hipGraphExec_t  (*build_bench)(int);         // no-ctx wrapper for bench()
   };
 
-  // Wrappers that drop the ctx pointer for the bench() call signature.
-  auto ws = [](int n) { return build_straight(n); };
-  auto wp2 = [](int n) { return build_paths2(n); };
-  auto wp4 = [](int n) { return build_paths4(n); };
-  auto wf2 = [](int n) { return build_full2(n); };
-  auto wf4 = [](int n) { return build_full4(n); };
+  auto ws  = [](int n) { return build_straight(n); };
+  auto wp2 = [](int n) { return build_paths2(n);   };
+  auto wp4 = [](int n) { return build_paths4(n);   };
+  auto wf2 = [](int n) { return build_full2(n);    };
+  auto wf4 = [](int n) { return build_full4(n);    };
 
   const Topo topos[] = {
       {"straight", build_straight, ws },
@@ -443,15 +533,25 @@ int main(int argc, char* argv[]) {
   // Verification mode
   // -------------------------------------------------------------------------
   if (do_verify) {
-    printf("Mode   : verify (size=%d)\n\n", size);
-    printf("%-10s  %s\n", "topology", "result");
-    printf("%s\n", std::string(24, '-').c_str());
+    printf("Mode   : verify (reduction-based ordering check, size=%d)\n\n",
+           size);
+    printf("%-10s  %-6s  %s\n", "topology", "exits", "result");
+    printf("%s\n", std::string(32, '-').c_str());
 
     bool all_pass = true;
     for (int t = 0; t < ntopos; ++t) {
       if (topo != "all" && topo != topos[t].name) continue;
-      const bool pass = verify(topos[t].build, size);
-      printf("%-10s  %s\n", topos[t].name, pass ? "PASS" : "FAIL");
+
+      // Dry-run build (no device alloc) just to count exits.
+      VerifyCtx dummy;
+      dummy.dev_buf = nullptr;
+      hipGraphExec_t tmp = topos[t].build(size, &dummy);
+      HIP_CHECK(hipGraphExecDestroy(tmp));
+      const int nexits = static_cast<int>(dummy.exits.size());
+
+      const bool pass = verify(topos[t].build, size, topos[t].name);
+      printf("%-10s  %-6d  %s\n", topos[t].name, nexits,
+             pass ? "PASS" : "FAIL");
       all_pass &= pass;
     }
     return all_pass ? 0 : 1;
@@ -479,7 +579,7 @@ int main(int argc, char* argv[]) {
       const int N = sweep_sizes[s];
       printf("%-7d", N);
       for (int t = 0; t < ntopos; ++t) {
-        hipGraphExec_t e = topos[t].build_bench(N);
+        hipGraphExec_t e   = topos[t].build_bench(N);
         const double   avg = bench(e, iters, syncInTiming);
         HIP_CHECK(hipGraphExecDestroy(e));
         printf("  %9.3f us", avg);
