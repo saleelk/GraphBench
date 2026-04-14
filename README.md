@@ -34,16 +34,29 @@ lower submission overhead.
 
 ## Build
 
-### With hipcc directly
+The benchmark is written against the HIP API. When compiled with `nvcc` the
+`hip*` symbols are automatically remapped to their `cuda*` equivalents via
+`#define` aliases at the top of the source file — no source changes needed.
+
+### HIP / AMD (default)
 
 ```bash
+# With hipcc directly
 /opt/rocm/bin/hipcc -O2 -o graph_bench graph_bench.cpp
+
+# With CMake
+cmake -B build -DCMAKE_PREFIX_PATH=/opt/rocm
+cmake --build build
 ```
 
-### With CMake
+### CUDA / NVIDIA
 
 ```bash
-cmake -B build -DCMAKE_PREFIX_PATH=/opt/rocm
+# With nvcc directly
+nvcc -O2 -x cu -o graph_bench graph_bench.cpp
+
+# With CMake
+cmake -B build -DUSE_CUDA=ON
 cmake --build build
 ```
 

@@ -24,8 +24,13 @@
 //
 //   full4     4 fully independent chains of N/4 nodes each — 4 segments.
 //
-// Build:
+// Build (HIP/AMD):
 //   /opt/rocm/bin/hipcc -O2 -o graph_bench graph_bench.cpp
+//   cmake -B build -DCMAKE_PREFIX_PATH=/opt/rocm && cmake --build build
+//
+// Build (CUDA/NVIDIA):
+//   nvcc -O2 -x cu -o graph_bench graph_bench.cpp
+//   cmake -B build -DUSE_CUDA=ON && cmake --build build
 //
 // Usage:
 //   ./graph_bench [--size N] [--iters N] [--no-sync] [--sync]
@@ -39,7 +44,44 @@
 //   --sweep           Run all sizes from 1 to 8192
 //   --topology <name> Benchmark only the named topology (default: all)
 
+// ---------------------------------------------------------------------------
+// HIP / CUDA portability layer
+// Code is written against the HIP API; when compiled with nvcc the hip*
+// symbols are remapped to their cuda* equivalents.
+// ---------------------------------------------------------------------------
+#if defined(__NVCC__)
+#include <cuda_runtime.h>
+// Type aliases
+#define hipError_t           cudaError_t
+#define hipDeviceProp_t      cudaDeviceProp
+#define hipStream_t          cudaStream_t
+#define hipGraph_t           cudaGraph_t
+#define hipGraphExec_t       cudaGraphExec_t
+#define hipGraphNode_t       cudaGraphNode_t
+#define hipKernelNodeParams  cudaKernelNodeParams
+// Error values
+#define hipSuccess           cudaSuccess
+// Runtime API
+#define hipGetDevice         cudaGetDevice
+#define hipGetDeviceProperties cudaGetDeviceProperties
+#define hipGetErrorString    cudaGetErrorString
+#define hipStreamCreate      cudaStreamCreate
+#define hipStreamDestroy     cudaStreamDestroy
+#define hipStreamSynchronize cudaStreamSynchronize
+// Graph API
+#define hipGraphCreate                cudaGraphCreate
+#define hipGraphDestroy               cudaGraphDestroy
+#define hipGraphAddKernelNode         cudaGraphAddKernelNode
+#define hipGraphInstantiate(e,g,_,__,f) cudaGraphInstantiate(e,g,nullptr,nullptr,f)
+#define hipGraphExecDestroy           cudaGraphExecDestroy
+#define hipGraphLaunch                cudaGraphLaunch
+// Stream capture
+#define hipStreamBeginCapture         cudaStreamBeginCapture
+#define hipStreamEndCapture           cudaStreamEndCapture
+#define hipStreamCaptureModeGlobal    cudaStreamCaptureModeGlobal
+#else
 #include <hip/hip_runtime.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
