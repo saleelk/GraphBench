@@ -1,4 +1,4 @@
-# GraphBench
+# graph_bench
 
 A microbenchmark for measuring `hipGraphLaunch` submission latency across
 different graph topologies and sizes on AMD GPUs.
@@ -37,7 +37,7 @@ lower submission overhead.
 ### With hipcc directly
 
 ```bash
-/opt/rocm/bin/hipcc -O2 -o topo_bench topo_bench.cpp
+/opt/rocm/bin/hipcc -O2 -o graph_bench graph_bench.cpp
 ```
 
 ### With CMake
@@ -50,7 +50,7 @@ cmake --build build
 ## Usage
 
 ```
-./topo_bench [options]
+./graph_bench [options]
 
 Options:
   --size N          Total number of kernel nodes (default: 1024)
@@ -67,19 +67,19 @@ Options:
 Run all topologies at size 1024, submission only:
 
 ```bash
-./topo_bench --size 1024 --no-sync
+./graph_bench --size 1024 --no-sync
 ```
 
 Run only `full4` with GPU execution included:
 
 ```bash
-./topo_bench --topology full4 --size 1024 --sync
+./graph_bench --topology full4 --size 1024 --sync
 ```
 
 Sweep all sizes for all topologies:
 
 ```bash
-./topo_bench --sweep --no-sync
+./graph_bench --sweep --no-sync
 ```
 
 ## Sample Output

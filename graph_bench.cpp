@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Saleel Kudchadker
 //
-// topo_bench.cpp
+// graph_bench.cpp
 //
 // Measures hipGraphLaunch latency across several graph topologies for a
 // sweep of graph sizes.  All topologies use approximately N total kernel
@@ -25,11 +25,11 @@
 //   full4     4 fully independent chains of N/4 nodes each — 4 segments.
 //
 // Build:
-//   /opt/rocm/bin/hipcc -O2 -o topo_bench topo_bench.cpp
+//   /opt/rocm/bin/hipcc -O2 -o graph_bench graph_bench.cpp
 //
 // Usage:
-//   ./topo_bench [--size N] [--iters N] [--no-sync] [--sync]
-//                [--sweep] [--topology <name>]
+//   ./graph_bench [--size N] [--iters N] [--no-sync] [--sync]
+//                 [--sweep] [--topology <name>]
 //
 //   --size N          Graph size / node count (default: 1024)
 //   --graphSize N     Alias for --size

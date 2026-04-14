@@ -6,6 +6,6 @@ set(CMAKE_HIP_STANDARD 17)
 
 find_package(hip REQUIRED)
 
-add_executable(topo_bench topo_bench.cpp)
-target_link_libraries(topo_bench PRIVATE hip::host)
-target_compile_options(topo_bench PRIVATE -O2)
+add_executable(graph_bench graph_bench.cpp)
+target_link_libraries(graph_bench PRIVATE hip::host)
+target_compile_options(graph_bench PRIVATE -O2)
