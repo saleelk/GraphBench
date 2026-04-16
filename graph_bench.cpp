@@ -215,6 +215,13 @@ struct VerifyCtx {
   std::vector<int>                             expected;    // expected[nodeId]
   std::vector<int>                             exits;       // exit node IDs
   std::unordered_map<hipGraphNode_t, int>      node_to_id;  // handle -> ID
+
+  // Stable heap storage for per-node kernel args.
+  // hipGraphAddKernelNode may store pointers into kernelParams rather than
+  // copying values immediately
+  // Each entry: {nodeId, d0, d1, d2, d3, ndeps} — must not reallocate after
+  // pointers are handed to hipGraphAddKernelNode, so reserve(N) before build.
+  std::vector<std::array<int, 6>> node_args;
 };
 
 // ---------------------------------------------------------------------------
@@ -254,14 +261,17 @@ static int add_node(hipGraph_t g, hipGraphNode_t* cur,
   int id = ctx->next_id++;
   ctx->expected.push_back(exp);
 
-  // hipGraphAddKernelNode copies args immediately, so locals are safe here.
+  // Store args in stable heap memory — hipGraphAddKernelNode may retain
+  // pointers until hipGraphInstantiate rather than copying values immediately.
+  ctx->node_args.push_back({id, d[0], d[1], d[2], d[3], ndeps});
+  auto& sa = ctx->node_args.back();
   void* args[] = {reinterpret_cast<void*>(&ctx->dev_buf),
-                  reinterpret_cast<void*>(&id),
-                  reinterpret_cast<void*>(&d[0]),
-                  reinterpret_cast<void*>(&d[1]),
-                  reinterpret_cast<void*>(&d[2]),
-                  reinterpret_cast<void*>(&d[3]),
-                  reinterpret_cast<void*>(&ndeps)};
+                  reinterpret_cast<void*>(&sa[0]),
+                  reinterpret_cast<void*>(&sa[1]),
+                  reinterpret_cast<void*>(&sa[2]),
+                  reinterpret_cast<void*>(&sa[3]),
+                  reinterpret_cast<void*>(&sa[4]),
+                  reinterpret_cast<void*>(&sa[5])};
   p.func         = reinterpret_cast<void*>(verify_kernel);
   p.kernelParams = args;
   HIP_CHECK(hipGraphAddKernelNode(cur, g, deps, ndeps, &p));
@@ -432,9 +442,14 @@ static double bench(hipGraphExec_t exec, int iters, bool syncInTiming) {
 // Builds the graph with verify_kernel nodes, launches once, copies back the
 // device buffer, and checks only the exit node(s) against their expected
 // values.  A wrong exit value means some node ran before a dependency.
+// *out_nexits is set to the number of exit nodes found.
 static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N,
-                   const char* name) {
+                   const char* name, int* out_nexits) {
   VerifyCtx ctx;
+  // Reserve N slots upfront so node_args never reallocates while
+  // hipGraphAddKernelNode holds pointers into it.
+  ctx.node_args.reserve(N);
+  ctx.expected.reserve(N);
   // Over-allocate: actual node count (after integer-division seg rounding)
   // may be slightly less than N, but never more.
   HIP_CHECK(hipMalloc(&ctx.dev_buf, N * sizeof(int)));
@@ -456,6 +471,8 @@ static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N,
 
   HIP_CHECK(hipGraphExecDestroy(exec));
   HIP_CHECK(hipFree(ctx.dev_buf));
+
+  *out_nexits = static_cast<int>(ctx.exits.size());
 
   bool pass = true;
   for (int exit_id : ctx.exits) {
@@ -541,15 +558,8 @@ int main(int argc, char* argv[]) {
     bool all_pass = true;
     for (int t = 0; t < ntopos; ++t) {
       if (topo != "all" && topo != topos[t].name) continue;
-
-      // Dry-run build (no device alloc) just to count exits.
-      VerifyCtx dummy;
-      dummy.dev_buf = nullptr;
-      hipGraphExec_t tmp = topos[t].build(size, &dummy);
-      HIP_CHECK(hipGraphExecDestroy(tmp));
-      const int nexits = static_cast<int>(dummy.exits.size());
-
-      const bool pass = verify(topos[t].build, size, topos[t].name);
+      int  nexits = 0;
+      const bool pass = verify(topos[t].build, size, topos[t].name, &nexits);
       printf("%-10s  %-6d  %s\n", topos[t].name, nexits,
              pass ? "PASS" : "FAIL");
       all_pass &= pass;
