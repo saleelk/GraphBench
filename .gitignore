@@ -1,0 +1,15 @@
+# Build directories
+build*/
+
+# Compiled binary
+graph_bench
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store

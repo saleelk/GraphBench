@@ -60,16 +60,20 @@
 //
 // Usage:
 //   ./graph_bench [--size N] [--iters N] [--no-sync] [--sync]
-//                 [--sweep] [--topology <name>] [--verify]
+//                 [--sweep] [--topology <name>] [--instantiate]
+//                 [--verify] [--verify-iters N] [--verify-delay-us N]
 //
-//   --size N          Total kernel nodes (default: 1024)
-//   --graphSize N     Alias for --size
-//   --iters N         Timed repetitions per measurement (default: 1000)
-//   --no-sync         Submission latency only (default)
-//   --sync            Submission + GPU execution latency
-//   --sweep           Run across all sizes: 1, 2, 4, ..., 8192
-//   --topology <name> Benchmark only the named topology (default: all)
-//   --verify          Run ordering correctness check instead of timing
+//   --size N            Total kernel nodes (default: 1024)
+//   --graphSize N       Alias for --size
+//   --iters N           Timed repetitions per measurement (default: 1000)
+//   --no-sync           Submission latency only (default)
+//   --sync              Submission + GPU execution latency
+//   --sweep             Run across all sizes: 1, 2, 4, ..., 8192
+//   --topology <name>   Benchmark only the named topology (default: all)
+//   --instantiate       Measure hipGraphInstantiate time (alongside launch)
+//   --verify            Run ordering correctness check instead of timing
+//   --verify-iters N    Verify launches per topology (default: 50)
+//   --verify-delay-us N Per-node busy-wait to widen race window (default: 1)
 
 // ---------------------------------------------------------------------------
 // HIP / CUDA portability layer
@@ -155,12 +159,6 @@ class Timer {
     return std::accumulate(samples_.begin(), samples_.end(), 0.0) /
            samples_.size();
   }
-  double min() const {
-    return *std::min_element(samples_.begin(), samples_.end());
-  }
-  double max() const {
-    return *std::max_element(samples_.begin(), samples_.end());
-  }
 
  private:
   std::chrono::high_resolution_clock::time_point t_;
@@ -185,13 +183,28 @@ __global__ void null_kernel() {}
 // comparison catches the ordering violation.
 //
 // Supports up to 4 predecessor IDs, which is enough for paths4 (join has 4).
+//
+// Race-window amplification: dependencies are read *early* (at kernel entry)
+// and this node's own result is written *late* (after an optional busy-wait of
+// delay_cycles).  If the runtime incorrectly schedules a successor before this
+// node finishes, that successor reads our slot while it is still 0, producing a
+// detectable deficit.  With near-zero-duration kernels the window is too small
+// to observe such bugs; the delay makes it reliably catchable.
 __global__ void verify_kernel(int* buf, int nodeId,
-                               int d0, int d1, int d2, int d3, int ndeps) {
+                               int d0, int d1, int d2, int d3, int ndeps,
+                               long long delay_cycles) {
   int val = 1;
   if (ndeps > 0) val += buf[d0];
   if (ndeps > 1) val += buf[d1];
   if (ndeps > 2) val += buf[d2];
   if (ndeps > 3) val += buf[d3];
+
+  if (delay_cycles > 0) {
+    const long long start = clock64();
+    long long now = start;
+    while (now - start < delay_cycles) now = clock64();
+  }
+
   buf[nodeId] = val;
 }
 
@@ -209,8 +222,9 @@ __global__ void verify_kernel(int* buf, int nodeId,
 // After the build, exits[] contains the exit node ID(s) and expected[] holds
 // the correct value for every node.  Only the exit values are checked.
 struct VerifyCtx {
-  int*  dev_buf  = nullptr;  // device buffer, size >= next_id (caller-owned)
-  int   next_id  = 0;        // auto-incremented as nodes are added
+  int*       dev_buf      = nullptr;  // device buffer (caller-owned)
+  int        next_id      = 0;        // auto-incremented as nodes are added
+  long long  delay_cycles = 0;        // per-node busy-wait (race amplifier)
 
   std::vector<int>                             expected;    // expected[nodeId]
   std::vector<int>                             exits;       // exit node IDs
@@ -265,13 +279,16 @@ static int add_node(hipGraph_t g, hipGraphNode_t* cur,
   // pointers until hipGraphInstantiate rather than copying values immediately.
   ctx->node_args.push_back({id, d[0], d[1], d[2], d[3], ndeps});
   auto& sa = ctx->node_args.back();
+  // delay_cycles is identical for all nodes; point every node at the single
+  // stable copy held in ctx (valid through instantiate).
   void* args[] = {reinterpret_cast<void*>(&ctx->dev_buf),
                   reinterpret_cast<void*>(&sa[0]),
                   reinterpret_cast<void*>(&sa[1]),
                   reinterpret_cast<void*>(&sa[2]),
                   reinterpret_cast<void*>(&sa[3]),
                   reinterpret_cast<void*>(&sa[4]),
-                  reinterpret_cast<void*>(&sa[5])};
+                  reinterpret_cast<void*>(&sa[5]),
+                  reinterpret_cast<void*>(&ctx->delay_cycles)};
   p.func         = reinterpret_cast<void*>(verify_kernel);
   p.kernelParams = args;
   HIP_CHECK(hipGraphAddKernelNode(cur, g, deps, ndeps, &p));
@@ -281,28 +298,24 @@ static int add_node(hipGraph_t g, hipGraphNode_t* cur,
 }
 
 // ---------------------------------------------------------------------------
-// Graph builders
+// Graph creators — build the hipGraph_t (node topology) without instantiating.
+// Callers instantiate separately so that instantiation can be timed.
 // ---------------------------------------------------------------------------
 
 // straight: single linear chain of N nodes.
 // Exit: the last node.
-static hipGraphExec_t build_straight(int N, VerifyCtx* ctx = nullptr) {
+static hipGraph_t create_straight(int N, VerifyCtx* ctx = nullptr) {
   hipGraph_t g;
   HIP_CHECK(hipGraphCreate(&g, 0));
 
   hipGraphNode_t prev{}, cur{};
-  int prev_id = -1, cur_id = -1;
+  int last_id = -1;
   for (int i = 0; i < N; ++i) {
-    cur_id  = add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
+    last_id = add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
     prev    = cur;
-    prev_id = cur_id;
   }
-  if (ctx && cur_id >= 0) ctx->exits.push_back(cur_id);
-
-  hipGraphExec_t e;
-  HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
-  HIP_CHECK(hipGraphDestroy(g));
-  return e;
+  if (ctx && last_id >= 0) ctx->exits.push_back(last_id);
+  return g;
 }
 
 // multi-path (hexagon): lead -> P parallel branches -> tail.
@@ -314,7 +327,7 @@ static hipGraphExec_t build_straight(int N, VerifyCtx* ctx = nullptr) {
 // If any branch tail ran after the join, its buf slot is 0 at join time,
 // making the join's actual value smaller than expected. That deficit
 // propagates through the tail chain to the single exit node.
-static hipGraphExec_t build_multi_path(int N, int P, VerifyCtx* ctx = nullptr) {
+static hipGraph_t create_multi_path(int N, int P, VerifyCtx* ctx = nullptr) {
   const int seg = std::max(1, N / (P + 2));
 
   hipGraph_t g;
@@ -322,64 +335,51 @@ static hipGraphExec_t build_multi_path(int N, int P, VerifyCtx* ctx = nullptr) {
 
   // Leading straight chain.
   hipGraphNode_t prev{}, cur{};
-  int prev_id = -1, cur_id = -1;
+  int last_id = -1;
   for (int i = 0; i < seg; ++i) {
-    cur_id  = add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
+    last_id = add_node(g, &cur, i == 0 ? nullptr : &prev, i == 0 ? 0 : 1, ctx);
     prev    = cur;
-    prev_id = cur_id;
   }
-  hipGraphNode_t split_node    = prev;
-  int            split_node_id = cur_id;
+  hipGraphNode_t split_node = prev;
 
   // P parallel branches, each rooted at split_node.
+  // Dependency wiring uses node handles, so only the tail handle is tracked.
   std::vector<hipGraphNode_t> path_ends(P);
-  std::vector<int>            path_end_ids(P);
   for (int path = 0; path < P; ++path) {
-    hipGraphNode_t pprev    = split_node;
-    int            pprev_id = split_node_id;
-    hipGraphNode_t pcur{};
-    int            pcur_id = -1;
+    hipGraphNode_t pprev = split_node, pcur{};
     for (int i = 0; i < seg; ++i) {
-      pcur_id = add_node(g, &pcur, &pprev, 1, ctx);
-      pprev   = pcur;
-      pprev_id = pcur_id;
+      add_node(g, &pcur, &pprev, 1, ctx);
+      pprev = pcur;
     }
-    path_ends[path]     = pprev;
-    path_end_ids[path]  = pprev_id;
+    path_ends[path] = pprev;
   }
 
   // Join node: depends on all P branch tails.
   hipGraphNode_t join{};
-  int join_id = add_node(g, &join, path_ends.data(), P, ctx);
+  last_id = add_node(g, &join, path_ends.data(), P, ctx);
   prev    = join;
-  prev_id = join_id;
 
   // Trailing straight chain.
   for (int i = 1; i < seg; ++i) {
-    cur_id  = add_node(g, &cur, &prev, 1, ctx);
+    last_id = add_node(g, &cur, &prev, 1, ctx);
     prev    = cur;
-    prev_id = cur_id;
   }
-  if (ctx && prev_id >= 0) ctx->exits.push_back(prev_id);
-
-  hipGraphExec_t e;
-  HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
-  HIP_CHECK(hipGraphDestroy(g));
-  return e;
+  if (ctx && last_id >= 0) ctx->exits.push_back(last_id);
+  return g;
 }
 
-static hipGraphExec_t build_paths2(int N, VerifyCtx* ctx = nullptr) {
-  return build_multi_path(N, 2, ctx);
+static hipGraph_t create_paths2(int N, VerifyCtx* ctx = nullptr) {
+  return create_multi_path(N, 2, ctx);
 }
-static hipGraphExec_t build_paths4(int N, VerifyCtx* ctx = nullptr) {
-  return build_multi_path(N, 4, ctx);
+static hipGraph_t create_paths4(int N, VerifyCtx* ctx = nullptr) {
+  return create_multi_path(N, 4, ctx);
 }
 
 // fully parallel: P independent chains of N/P nodes.
 // No synchronisation point — GPU can schedule all chains concurrently.
 // Exit: last node of each chain (P exits total).
-static hipGraphExec_t build_full_parallel(int N, int P,
-                                          VerifyCtx* ctx = nullptr) {
+static hipGraph_t create_full_parallel(int N, int P,
+                                       VerifyCtx* ctx = nullptr) {
   const int seg = std::max(1, N / P);
 
   hipGraph_t g;
@@ -387,31 +387,26 @@ static hipGraphExec_t build_full_parallel(int N, int P,
 
   for (int path = 0; path < P; ++path) {
     hipGraphNode_t pprev{}, pcur{};
-    int            pprev_id = -1, pcur_id = -1;
+    int            last_id = -1;
     for (int i = 0; i < seg; ++i) {
-      pcur_id  = add_node(g, &pcur,
-                          i == 0 ? nullptr : &pprev, i == 0 ? 0 : 1, ctx);
-      pprev    = pcur;
-      pprev_id = pcur_id;
+      last_id = add_node(g, &pcur,
+                         i == 0 ? nullptr : &pprev, i == 0 ? 0 : 1, ctx);
+      pprev   = pcur;
     }
-    if (ctx && pprev_id >= 0) ctx->exits.push_back(pprev_id);
+    if (ctx && last_id >= 0) ctx->exits.push_back(last_id);
   }
-
-  hipGraphExec_t e;
-  HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
-  HIP_CHECK(hipGraphDestroy(g));
-  return e;
+  return g;
 }
 
-static hipGraphExec_t build_full2(int N, VerifyCtx* ctx = nullptr) {
-  return build_full_parallel(N, 2, ctx);
+static hipGraph_t create_full2(int N, VerifyCtx* ctx = nullptr) {
+  return create_full_parallel(N, 2, ctx);
 }
-static hipGraphExec_t build_full4(int N, VerifyCtx* ctx = nullptr) {
-  return build_full_parallel(N, 4, ctx);
+static hipGraph_t create_full4(int N, VerifyCtx* ctx = nullptr) {
+  return create_full_parallel(N, 4, ctx);
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark runner
+// Benchmark runners
 // ---------------------------------------------------------------------------
 
 static double bench(hipGraphExec_t exec, int iters, bool syncInTiming) {
@@ -435,17 +430,42 @@ static double bench(hipGraphExec_t exec, int iters, bool syncInTiming) {
   return t.avg();
 }
 
+// Measures hipGraphInstantiate latency for a single cold instantiation.
+// Returns the elapsed time in microseconds and the resulting hipGraphExec_t
+// (caller owns it).
+static double bench_instantiate(hipGraph_t graph, hipGraphExec_t* out) {
+  Timer t;
+  t.reserve(1);
+  hipGraphExec_t e;
+  t.start();
+  HIP_CHECK(hipGraphInstantiate(&e, graph, nullptr, nullptr, 0));
+  t.stop();
+  *out = e;
+  return t.avg();
+}
+
 // ---------------------------------------------------------------------------
 // Verification runner
 // ---------------------------------------------------------------------------
 
-// Builds the graph with verify_kernel nodes, launches once, copies back the
-// device buffer, and checks only the exit node(s) against their expected
-// values.  A wrong exit value means some node ran before a dependency.
+// Builds the graph with verify_kernel nodes and repeatedly launches it,
+// resetting the device buffer before each launch.  After every launch the
+// full buffer is copied back and *all* node values are compared against the
+// CPU-computed expected values (not just the exits), which both catches
+// ordering violations that do not propagate to an exit and pinpoints where
+// the violation occurred.
+//
+// Running multiple iterations is important because ordering bugs are
+// nondeterministic; a single launch may pass by luck.  Each verify_kernel
+// also busy-waits delay_cycles before writing its result, widening the window
+// in which an out-of-order successor would observe a stale 0.
+//
 // *out_nexits is set to the number of exit nodes found.
-static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N,
-                   const char* name, int* out_nexits) {
+static bool verify(hipGraph_t (*create)(int, VerifyCtx*), int N,
+                   const char* name, long long delay_cycles, int iters,
+                   int* out_nexits) {
   VerifyCtx ctx;
+  ctx.delay_cycles = delay_cycles;
   // Reserve N slots upfront so node_args never reallocates while
   // hipGraphAddKernelNode holds pointers into it.
   ctx.node_args.reserve(N);
@@ -453,39 +473,45 @@ static bool verify(hipGraphExec_t (*build)(int, VerifyCtx*), int N,
   // Over-allocate: actual node count (after integer-division seg rounding)
   // may be slightly less than N, but never more.
   HIP_CHECK(hipMalloc(&ctx.dev_buf, N * sizeof(int)));
-  HIP_CHECK(hipMemset(ctx.dev_buf, 0, N * sizeof(int)));
 
-  hipGraphExec_t exec = build(N, &ctx);
+  hipGraph_t g = create(N, &ctx);
+  hipGraphExec_t exec;
+  HIP_CHECK(hipGraphInstantiate(&exec, g, nullptr, nullptr, 0));
+  HIP_CHECK(hipGraphDestroy(g));
+
+  *out_nexits = static_cast<int>(ctx.exits.size());
+  const int total = ctx.next_id;
 
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
-  HIP_CHECK(hipGraphLaunch(exec, stream));
-  HIP_CHECK(hipStreamSynchronize(stream));
-  HIP_CHECK(hipStreamDestroy(stream));
 
-  // Copy only the slots we need.
-  const int total = ctx.next_id;
   std::vector<int> host(total);
-  HIP_CHECK(hipMemcpy(host.data(), ctx.dev_buf, total * sizeof(int),
-                      hipMemcpyDeviceToHost));
+  bool pass     = true;
+  int  reported = 0;
+  for (int it = 0; it < iters && pass; ++it) {
+    HIP_CHECK(hipMemset(ctx.dev_buf, 0, total * sizeof(int)));
+    HIP_CHECK(hipGraphLaunch(exec, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+    HIP_CHECK(hipMemcpy(host.data(), ctx.dev_buf, total * sizeof(int),
+                        hipMemcpyDeviceToHost));
 
-  HIP_CHECK(hipGraphExecDestroy(exec));
-  HIP_CHECK(hipFree(ctx.dev_buf));
-
-  *out_nexits = static_cast<int>(ctx.exits.size());
-
-  bool pass = true;
-  for (int exit_id : ctx.exits) {
-    const int got      = host[exit_id];
-    const int expected = ctx.expected[exit_id];
-    if (got != expected) {
-      fprintf(stderr,
-              "  [%s] FAIL exit node %d: got %d, expected %d "
-              "(ordering violation detected)\n",
-              name, exit_id, got, expected);
-      pass = false;
+    for (int id = 0; id < total; ++id) {
+      if (host[id] != ctx.expected[id]) {
+        if (reported < 8) {
+          fprintf(stderr,
+                  "  [%s] FAIL iter %d node %d: got %d, expected %d "
+                  "(ordering violation)\n",
+                  name, it, id, host[id], ctx.expected[id]);
+          ++reported;
+        }
+        pass = false;
+      }
     }
   }
+
+  HIP_CHECK(hipStreamDestroy(stream));
+  HIP_CHECK(hipGraphExecDestroy(exec));
+  HIP_CHECK(hipFree(ctx.dev_buf));
   return pass;
 }
 
@@ -499,6 +525,9 @@ int main(int argc, char* argv[]) {
   bool        syncInTiming = false;
   bool        sweep        = false;
   bool        do_verify    = false;
+  bool        measure_inst = false;
+  int         verify_iters = 50;
+  int         verify_delay_us = 1;
   std::string topo         = "all";
 
   for (int i = 1; i < argc; ++i) {
@@ -515,8 +544,14 @@ int main(int argc, char* argv[]) {
       sweep = true;
     else if (!strcmp(argv[i], "--topology") && i + 1 < argc)
       topo = argv[++i];
+    else if (!strcmp(argv[i], "--instantiate"))
+      measure_inst = true;
     else if (!strcmp(argv[i], "--verify"))
       do_verify = true;
+    else if (!strcmp(argv[i], "--verify-iters") && i + 1 < argc)
+      verify_iters = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--verify-delay-us") && i + 1 < argc)
+      verify_delay_us = atoi(argv[++i]);
   }
 
   int deviceId;
@@ -526,41 +561,59 @@ int main(int argc, char* argv[]) {
   printf("Device : %s\n", props.name);
 
   struct Topo {
-    const char*       name;
-    hipGraphExec_t  (*build)(int, VerifyCtx*);  // verify-capable builder
-    hipGraphExec_t  (*build_bench)(int);         // no-ctx wrapper for bench()
+    const char*     name;
+    hipGraph_t    (*create)(int, VerifyCtx*);
   };
-
-  auto ws  = [](int n) { return build_straight(n); };
-  auto wp2 = [](int n) { return build_paths2(n);   };
-  auto wp4 = [](int n) { return build_paths4(n);   };
-  auto wf2 = [](int n) { return build_full2(n);    };
-  auto wf4 = [](int n) { return build_full4(n);    };
 
   const Topo topos[] = {
-      {"straight", build_straight, ws },
-      {"paths2",   build_paths2,   wp2},
-      {"paths4",   build_paths4,   wp4},
-      {"full2",    build_full2,    wf2},
-      {"full4",    build_full4,    wf4},
+      {"straight", create_straight},
+      {"paths2",   create_paths2},
+      {"paths4",   create_paths4},
+      {"full2",    create_full2},
+      {"full4",    create_full4},
   };
   const int ntopos = static_cast<int>(sizeof(topos) / sizeof(topos[0]));
+
+  // Build the list of selected topology indices based on --topology.
+  std::vector<int> sel;
+  for (int t = 0; t < ntopos; ++t) {
+    if (topo == "all" || topo == topos[t].name) sel.push_back(t);
+  }
+  const int nsel = static_cast<int>(sel.size());
+
+  if (nsel == 0) {
+    fprintf(stderr, "Unknown topology '%s'.  Available:", topo.c_str());
+    for (int t = 0; t < ntopos; ++t) fprintf(stderr, " %s", topos[t].name);
+    fprintf(stderr, "\n");
+    return 1;
+  }
 
   // -------------------------------------------------------------------------
   // Verification mode
   // -------------------------------------------------------------------------
   if (do_verify) {
-    printf("Mode   : verify (reduction-based ordering check, size=%d)\n\n",
-           size);
+    // Convert the requested per-node delay (microseconds) to device clock
+    // cycles for clock64().  props.clockRate is in kHz, so cycles-per-us is
+    // clockRate/1000.  Fall back to ~1.7 GHz if the runtime reports 0.
+    const long long cyc_per_us =
+        props.clockRate > 0 ? props.clockRate / 1000 : 1700;
+    const long long delay_cycles =
+        static_cast<long long>(verify_delay_us) * cyc_per_us;
+
+    printf("Mode   : verify (ordering check, size=%d, iters=%d, "
+           "delay=%dus/node)\n\n",
+           size, verify_iters, verify_delay_us);
     printf("%-10s  %-6s  %s\n", "topology", "exits", "result");
     printf("%s\n", std::string(32, '-').c_str());
 
     bool all_pass = true;
-    for (int t = 0; t < ntopos; ++t) {
-      if (topo != "all" && topo != topos[t].name) continue;
+    for (int si = 0; si < nsel; ++si) {
+      const auto& tp = topos[sel[si]];
       int  nexits = 0;
-      const bool pass = verify(topos[t].build, size, topos[t].name, &nexits);
-      printf("%-10s  %-6d  %s\n", topos[t].name, nexits,
+      const bool pass =
+          verify(tp.create, size, tp.name, delay_cycles, verify_iters,
+                 &nexits);
+      printf("%-10s  %-6d  %s\n", tp.name, nexits,
              pass ? "PASS" : "FAIL");
       all_pass &= pass;
     }
@@ -572,7 +625,9 @@ int main(int argc, char* argv[]) {
   // -------------------------------------------------------------------------
   printf("Mode   : %s\n",
          syncInTiming ? "sync (submission+GPU)" : "no-sync (submission only)");
-  printf("Iters  : %d per measurement\n\n", iters);
+  printf("Iters  : %d per measurement\n", iters);
+  if (measure_inst) printf("Metrics: instantiate + launch\n");
+  printf("\n");
 
   if (sweep) {
     const int sweep_sizes[] = {1,   2,   4,    8,    16,   32,
@@ -581,31 +636,82 @@ int main(int argc, char* argv[]) {
     const int nsizes =
         static_cast<int>(sizeof(sweep_sizes) / sizeof(sweep_sizes[0]));
 
+    // ----- Instantiation sweep table -----
+    if (measure_inst) {
+      printf("--- instantiate (us) ---\n");
+      printf("%-7s", "size");
+      for (int si = 0; si < nsel; ++si)
+        printf("  %10s", topos[sel[si]].name);
+      printf("\n%s\n", std::string(7 + nsel * 12, '-').c_str());
+
+      for (int s = 0; s < nsizes; ++s) {
+        const int N = sweep_sizes[s];
+        printf("%-7d", N);
+        for (int si = 0; si < nsel; ++si) {
+          hipGraph_t g = topos[sel[si]].create(N, nullptr);
+          hipGraphExec_t e;
+          const double avg = bench_instantiate(g, &e);
+          HIP_CHECK(hipGraphExecDestroy(e));
+          HIP_CHECK(hipGraphDestroy(g));
+          printf("  %9.3f us", avg);
+        }
+        printf("\n");
+        fflush(stdout);
+      }
+      printf("\n");
+    }
+
+    // ----- Launch sweep table -----
+    printf("--- launch (us) ---\n");
     printf("%-7s", "size");
-    for (int t = 0; t < ntopos; ++t) printf("  %10s", topos[t].name);
-    printf("\n%s\n", std::string(7 + ntopos * 12, '-').c_str());
+    for (int si = 0; si < nsel; ++si)
+      printf("  %10s", topos[sel[si]].name);
+    printf("\n%s\n", std::string(7 + nsel * 12, '-').c_str());
 
     for (int s = 0; s < nsizes; ++s) {
       const int N = sweep_sizes[s];
       printf("%-7d", N);
-      for (int t = 0; t < ntopos; ++t) {
-        hipGraphExec_t e   = topos[t].build_bench(N);
-        const double   avg = bench(e, iters, syncInTiming);
+      for (int si = 0; si < nsel; ++si) {
+        hipGraph_t g = topos[sel[si]].create(N, nullptr);
+        hipGraphExec_t e;
+        HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
+        HIP_CHECK(hipGraphDestroy(g));
+        const double avg = bench(e, iters, syncInTiming);
         HIP_CHECK(hipGraphExecDestroy(e));
         printf("  %9.3f us", avg);
       }
       printf("\n");
       fflush(stdout);
     }
+
   } else {
-    printf("%-10s  %s\n", "topology", "avg (us)");
-    printf("%s\n", std::string(30, '-').c_str());
-    for (int t = 0; t < ntopos; ++t) {
-      if (topo != "all" && topo != topos[t].name) continue;
-      hipGraphExec_t e   = topos[t].build_bench(size);
-      const double   avg = bench(e, iters, syncInTiming);
-      HIP_CHECK(hipGraphExecDestroy(e));
-      printf("%-10s  %.3f us\n", topos[t].name, avg);
+    // ----- Single-size mode -----
+    if (measure_inst) {
+      printf("%-10s  %12s  %12s\n", "topology", "inst (us)", "launch (us)");
+      printf("%s\n", std::string(38, '-').c_str());
+      for (int si = 0; si < nsel; ++si) {
+        const auto& tp = topos[sel[si]];
+        hipGraph_t g = tp.create(size, nullptr);
+        hipGraphExec_t e;
+        const double inst_avg = bench_instantiate(g, &e);
+        HIP_CHECK(hipGraphDestroy(g));
+        const double launch_avg = bench(e, iters, syncInTiming);
+        HIP_CHECK(hipGraphExecDestroy(e));
+        printf("%-10s  %9.3f     %9.3f\n", tp.name, inst_avg, launch_avg);
+      }
+    } else {
+      printf("%-10s  %s\n", "topology", "avg (us)");
+      printf("%s\n", std::string(30, '-').c_str());
+      for (int si = 0; si < nsel; ++si) {
+        const auto& tp = topos[sel[si]];
+        hipGraph_t g = tp.create(size, nullptr);
+        hipGraphExec_t e;
+        HIP_CHECK(hipGraphInstantiate(&e, g, nullptr, nullptr, 0));
+        HIP_CHECK(hipGraphDestroy(g));
+        const double avg = bench(e, iters, syncInTiming);
+        HIP_CHECK(hipGraphExecDestroy(e));
+        printf("%-10s  %.3f us\n", tp.name, avg);
+      }
     }
   }
 

@@ -66,13 +66,17 @@ cmake --build build
 ./graph_bench [options]
 
 Options:
-  --size N          Total number of kernel nodes (default: 1024)
-  --graphSize N     Alias for --size
-  --iters N         Timed repetitions per measurement (default: 1000)
-  --no-sync         Measure submission latency only (default)
-  --sync            Measure submission + GPU execution latency
-  --sweep           Run across all sizes: 1, 2, 4, 8, ..., 8192
-  --topology <name> Benchmark only the named topology (default: all)
+  --size N            Total number of kernel nodes (default: 1024)
+  --graphSize N       Alias for --size
+  --iters N           Timed repetitions per measurement (default: 1000)
+  --no-sync           Measure submission latency only (default)
+  --sync              Measure submission + GPU execution latency
+  --sweep             Run across all sizes: 1, 2, 4, 8, ..., 8192
+  --topology <name>   Benchmark only the named topology (default: all)
+  --instantiate       Measure hipGraphInstantiate time (alongside launch)
+  --verify            Run ordering correctness check instead of timing
+  --verify-iters N    Verify launches per topology (default: 50)
+  --verify-delay-us N Per-node busy-wait to widen the race window (default: 1)
 ```
 
 ## Examples
@@ -95,19 +99,119 @@ Sweep all sizes for all topologies:
 ./graph_bench --sweep --no-sync
 ```
 
+Sweep a single topology across all sizes:
+
+```bash
+./graph_bench --sweep --topology paths2
+```
+
+Measure instantiation time alongside launch latency:
+
+```bash
+./graph_bench --instantiate --size 1024
+```
+
+Sweep with instantiation for a specific topology:
+
+```bash
+./graph_bench --sweep --topology straight --instantiate
+```
+
+Verify ordering correctness (all topologies):
+
+```bash
+./graph_bench --verify --size 1024
+```
+
+Stress a single topology harder for race detection:
+
+```bash
+./graph_bench --verify --topology paths4 --verify-iters 200 --verify-delay-us 10
+```
+
+## Verification
+
+`--verify` swaps the empty timing kernel for a reduction kernel that computes
+`buf[nodeId] = sum(buf[dep_ids]) + 1`. Expected values are computed on the CPU
+at build time using the same recurrence, and after each launch every node (not
+just the exits) is compared against its expected value. A node that ran before
+one of its dependencies reads a stale `0`, producing a deficit that is caught
+by the comparison.
+
+To make nondeterministic ordering bugs observable, verification:
+
+- launches each graph `--verify-iters` times (default 50), resetting the buffer
+  before every launch, since a single launch can pass by luck; and
+- has every node read its dependencies *early* and write its own result *late*,
+  after busy-waiting `--verify-delay-us` microseconds (default 1). This widens
+  the window during which an out-of-order successor would observe the stale `0`.
+
+Increase both knobs to hunt harder for dependency-handling bugs in the runtime.
+
 ## Sample Output
+
+### Launch sweep (default)
 
 ```
 Device : AMD Instinct MI300X
 Mode   : no-sync (submission only)
 Iters  : 1000 per measurement
 
+--- launch (us) ---
 size      straight      paths2      paths4       full2       full4
 ---------------------------------------------------------------------
-1             0.798       0.912       1.102       0.854       1.023 us
+1            0.798       0.912       1.102       0.854       1.023
 ...
-1024         15.231      18.442      22.105      16.312      20.877 us
-8192        120.154     143.211     178.334     127.442     159.221 us
+1024        15.231      18.442      22.105      16.312      20.877
+8192       120.154     143.211     178.334     127.442     159.221
+```
+
+### Instantiate + launch (--instantiate)
+
+```
+Device : AMD Instinct MI300X
+Mode   : no-sync (submission only)
+Iters  : 1000 per measurement
+Metrics: instantiate + launch
+
+topology      inst (us)    launch (us)
+--------------------------------------
+straight        45.678         15.231
+paths2          78.901         18.442
+paths4         112.345         22.105
+full2           56.789         16.312
+full4           89.012         20.877
+```
+
+### Sweep with topology filter (--sweep --topology paths2)
+
+```
+Device : AMD Instinct MI300X
+Mode   : no-sync (submission only)
+Iters  : 1000 per measurement
+
+--- launch (us) ---
+size        paths2
+-------------------
+1            0.912
+...
+1024        18.442
+8192       143.211
+```
+
+### Verification (--verify)
+
+```
+Device : AMD Instinct MI300X
+Mode   : verify (ordering check, size=1024, iters=50, delay=1us/node)
+
+topology    exits   result
+--------------------------------
+straight    1       PASS
+paths2      1       PASS
+paths4      1       PASS
+full2       2       PASS
+full4       4       PASS
 ```
 
 ## License
